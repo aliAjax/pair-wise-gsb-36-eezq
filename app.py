@@ -28,9 +28,160 @@ def parse_date(value: str, field: str = "日期") -> date:
 
 
 class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, details: list[dict[str, Any]] | None = None):
         super().__init__(message)
         self.status = status
+        # 拆分核对差额等结构化问题，随错误响应一并返回给调用方。
+        self.details = details
+
+
+EPS = 1e-9
+
+
+def normalize_split_children(source: sqlite3.Row | dict[str, Any], raw_children: Any) -> list[dict[str, Any]]:
+    """把申请人提交的子账户草稿整理成统一结构（不访问数据库、不做业务判断）。"""
+    if not isinstance(raw_children, list) or not raw_children:
+        raise DomainError("子账户列表不能为空")
+    children: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_children):
+        if not isinstance(item, dict):
+            raise DomainError(f"第{index + 1}个子账户格式不正确")
+
+        def number(key: str) -> float:
+            try:
+                return float(item[key])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DomainError(f"第{index + 1}个子账户的{key}必须是数值") from exc
+
+        try:
+            priority = int(item.get("priority", source["priority"]))
+        except (TypeError, ValueError) as exc:
+            raise DomainError(f"第{index + 1}个子账户的优先级必须是整数") from exc
+        valid_from = parse_date(str(item.get("valid_from") or source["valid_from"]), "生效日期")
+        valid_to = parse_date(str(item.get("valid_to") or source["valid_to"]), "失效日期")
+
+        def id_list(key: str) -> list[int]:
+            value = item.get(key, [])
+            if not isinstance(value, list):
+                raise DomainError(f"第{index + 1}个子账户承接的转让必须是编号列表")
+            try:
+                return [int(v) for v in value]
+            except (TypeError, ValueError) as exc:
+                raise DomainError(f"第{index + 1}个子账户承接的转让编号必须是整数") from exc
+
+        children.append({
+            "name": str(item.get("name", "")).strip(),
+            "holder": str(item.get("holder", "")).strip(),
+            "region": str(item.get("region") or source["region"]).strip(),
+            "priority": priority,
+            "valid_from": valid_from.isoformat(),
+            "valid_to": valid_to.isoformat(),
+            "quota": number("quota"),
+            "used": number("used"),
+            "outgoing_transfer_ids": id_list("outgoing_transfer_ids"),
+            "incoming_transfer_ids": id_list("incoming_transfer_ids"),
+        })
+    return children
+
+
+def evaluate_split(snapshot: dict[str, Any], children: list[dict[str, Any]]) -> dict[str, Any]:
+    """纯判断：逐项核对许可额度、已用水量、待审转让承接是否与拆分前一致。"""
+    source = snapshot["source"]
+    outgoing = {int(t["id"]): t for t in snapshot["pending_outgoing"]}
+    incoming = {int(t["id"]): t for t in snapshot["pending_incoming"]}
+    pending = {**outgoing, **incoming}
+    existing_names = set(snapshot["existing_names"])
+    differences: list[dict[str, Any]] = []
+    assigned: dict[int, dict[str, Any]] = {}
+    seen_names: set[str] = set()
+    total_quota = total_used = 0.0
+
+    for idx, child in enumerate(children):
+        quota, used = float(child["quota"]), float(child["used"])
+        total_quota += quota
+        total_used += used
+        name = child["name"]
+        if not name:
+            differences.append({"code": "child_name_missing", "child_index": idx,
+                                "message": f"第{idx + 1}个子账户缺少名称"})
+        elif name in seen_names:
+            differences.append({"code": "child_name_duplicate", "child_index": idx, "name": name,
+                                "message": f"子账户名称“{name}”重复"})
+        else:
+            seen_names.add(name)
+            if name in existing_names:
+                differences.append({"code": "child_name_exists", "child_index": idx, "name": name,
+                                    "message": f"账户名称“{name}”已存在"})
+        if not child["holder"]:
+            differences.append({"code": "child_holder_missing", "child_index": idx,
+                                "message": f"子账户“{name or idx + 1}”缺少持有人"})
+        if not 1 <= int(child["priority"]) <= 5:
+            differences.append({"code": "child_priority_invalid", "child_index": idx,
+                                "message": f"子账户“{name or idx + 1}”的优先级应在 1 到 5 之间"})
+        if child["valid_from"] > child["valid_to"]:
+            differences.append({"code": "child_validity_invalid", "child_index": idx,
+                                "message": f"子账户“{name or idx + 1}”的生效日期不能晚于失效日期"})
+        if quota < 0 or used < 0:
+            differences.append({"code": "child_negative", "child_index": idx, "name": name,
+                                "message": f"子账户“{name or idx + 1}”的额度和已用水量不能为负"})
+        if used > quota + EPS:
+            differences.append({"code": "child_used_over_quota", "child_index": idx, "name": name,
+                                "quota": quota, "used": used,
+                                "message": f"子账户“{name or idx + 1}”已用水量 {used:g} 超过许可额度 {quota:g}"})
+        reserved_outgoing = 0.0
+        for direction, ids in (("outgoing", child["outgoing_transfer_ids"]),
+                               ("incoming", child["incoming_transfer_ids"])):
+            for transfer_id in ids:
+                transfer = pending.get(int(transfer_id))
+                if transfer is None:
+                    differences.append({"code": "transfer_unknown", "child_index": idx,
+                                        "transfer_id": transfer_id,
+                                        "message": f"转让 {transfer_id} 不是该账户的待审转让"})
+                    continue
+                if int(transfer_id) in assigned:
+                    differences.append({"code": "transfer_duplicate", "child_index": idx,
+                                        "transfer_id": transfer_id,
+                                        "message": f"待审转让 {transfer_id} 被重复承接"})
+                    continue
+                assigned[int(transfer_id)] = {"child_index": idx, "direction": direction}
+                if direction == "outgoing":
+                    reserved_outgoing += float(transfer["amount"])
+                    if int(child["priority"]) > int(transfer["other_priority"]):
+                        differences.append({"code": "transfer_priority_conflict", "child_index": idx,
+                                            "transfer_id": transfer_id,
+                                            "message": f"承接转出 {transfer_id} 后会违反优先级保护"})
+                elif int(transfer["other_priority"]) > int(child["priority"]):
+                    differences.append({"code": "transfer_priority_conflict", "child_index": idx,
+                                        "transfer_id": transfer_id,
+                                        "message": f"承接转入 {transfer_id} 后会违反优先级保护"})
+        if used + reserved_outgoing > quota + EPS:
+            differences.append({"code": "child_reserved_over_quota", "child_index": idx, "name": name,
+                                "quota": quota, "used": used, "reserved_outgoing": reserved_outgoing,
+                                "message": f"子账户“{name or idx + 1}”已用水量加承接的待审转出超过许可额度"})
+
+    quota_diff = float(source["quota"]) - total_quota
+    if abs(quota_diff) > EPS:
+        differences.append({"code": "quota_mismatch", "expected": float(source["quota"]),
+                            "actual": total_quota, "diff": quota_diff,
+                            "message": f"许可额度合计 {total_quota:g}，与拆分前 {float(source['quota']):g} 相差 {quota_diff:g}"})
+    used_diff = float(source["used"]) - total_used
+    if abs(used_diff) > EPS:
+        differences.append({"code": "used_mismatch", "expected": float(source["used"]),
+                            "actual": total_used, "diff": used_diff,
+                            "message": f"已用水量合计 {total_used:g}，与拆分前 {float(source['used']):g} 相差 {used_diff:g}"})
+    for transfer_id, transfer in pending.items():
+        if transfer_id not in assigned:
+            direction = "转出" if transfer_id in outgoing else "转入"
+            differences.append({"code": "transfer_unassigned", "transfer_id": transfer_id,
+                                "amount": float(transfer["amount"]), "direction": direction,
+                                "message": f"待审{direction}转让 {transfer_id}（{float(transfer['amount']):g}）没有子账户承接"})
+
+    return {"ok": not differences, "differences": differences,
+            "totals": {"quota": total_quota, "used": total_used,
+                       "expected_quota": float(source["quota"]),
+                       "expected_used": float(source["used"]),
+                       "assigned_transfers": len(assigned),
+                       "pending_transfers": len(pending)}}
 
 
 class Database:
@@ -59,8 +210,24 @@ class Database:
                     valid_to TEXT NOT NULL,
                     quota REAL NOT NULL CHECK(quota >= 0),
                     used REAL NOT NULL DEFAULT 0 CHECK(used >= 0),
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','closed')),
+                    split_from INTEGER REFERENCES accounts(id),
                     created_at TEXT NOT NULL,
                     CHECK(valid_from <= valid_to)
+                );
+                CREATE TABLE IF NOT EXISTS account_splits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_account_id INTEGER NOT NULL REFERENCES accounts(id),
+                    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','applied')),
+                    children TEXT NOT NULL,
+                    differences TEXT NOT NULL DEFAULT '[]',
+                    totals TEXT NOT NULL DEFAULT '{}',
+                    note TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL,
+                    applied_by TEXT,
+                    created_at TEXT NOT NULL,
+                    applied_at TEXT,
+                    UNIQUE(source_account_id, status)
                 );
                 CREATE TABLE IF NOT EXISTS transfers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +278,12 @@ class Database:
                 );
                 """
             )
+            # 旧版本数据库没有账户状态列，按顺序补齐（SQLite 不支持 IF NOT EXISTS ADD COLUMN）。
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)")}
+            if "status" not in columns:
+                conn.execute("ALTER TABLE accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            if "split_from" not in columns:
+                conn.execute("ALTER TABLE accounts ADD COLUMN split_from INTEGER REFERENCES accounts(id)")
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -185,6 +358,196 @@ class Database:
             raise DomainError("水权账户不存在", 404)
         return row
 
+    def _require_active(self, row: sqlite3.Row, label: str = "账户") -> None:
+        if row["status"] != "active":
+            raise DomainError(f"{label}已随拆分关闭，只供查询，不能再办理业务", 409)
+
+    def _split_snapshot(self, conn: sqlite3.Connection, account_id: int) -> dict[str, Any]:
+        """取数层：汇总拆分前的账户、待审转让（含对手方优先级）和现有账户名。"""
+        source = self._account_row(conn, account_id)
+        pending_out = [
+            dict(r) for r in conn.execute(
+                """SELECT t.id,t.from_account_id,t.to_account_id,t.amount,t.effective_date,
+                          a.priority AS other_priority,a.name AS other_name
+                   FROM transfers t JOIN accounts a ON a.id=t.to_account_id
+                   WHERE t.from_account_id=? AND t.status='pending'""",
+                (account_id,),
+            )
+        ]
+        pending_in = [
+            dict(r) for r in conn.execute(
+                """SELECT t.id,t.from_account_id,t.to_account_id,t.amount,t.effective_date,
+                          a.priority AS other_priority,a.name AS other_name
+                   FROM transfers t JOIN accounts a ON a.id=t.from_account_id
+                   WHERE t.to_account_id=? AND t.status='pending'""",
+                (account_id,),
+            )
+        ]
+        existing_names = [r["name"] for r in conn.execute("SELECT name FROM accounts")]
+        return {"source": dict(source), "pending_outgoing": pending_out,
+                "pending_incoming": pending_in, "existing_names": existing_names}
+
+    def split_preview(self, account_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            snapshot = self._split_snapshot(conn, account_id)
+        source = snapshot["source"]
+        return {
+            "source": source,
+            "quota": source["quota"],
+            "used": source["used"],
+            "pending_outgoing": snapshot["pending_outgoing"],
+            "pending_incoming": snapshot["pending_incoming"],
+        }
+
+    def _split_detail(self, conn: sqlite3.Connection, split_id: int) -> dict[str, Any]:
+        row = conn.execute("SELECT * FROM account_splits WHERE id=?", (split_id,)).fetchone()
+        if not row:
+            raise DomainError("拆分记录不存在", 404)
+        source = self._account_row(conn, row["source_account_id"])
+        children = json.loads(row["children"])
+        if row["status"] == "applied":
+            new_rows = conn.execute(
+                "SELECT id,name,quota,used,status FROM accounts WHERE split_from=? ORDER BY id",
+                (row["source_account_id"],),
+            ).fetchall()
+            new_by_name = {r["name"]: dict(r) for r in new_rows}
+            for child in children:
+                created = new_by_name.get(child["name"])
+                child["new_account_id"] = int(created["id"]) if created else None
+                if created:
+                    child["current_quota"] = created["quota"]
+                    child["current_used"] = created["used"]
+                    child["current_status"] = created["status"]
+        return {
+            "id": row["id"],
+            "source_account_id": row["source_account_id"],
+            "status": row["status"],
+            "note": row["note"],
+            "children": children,
+            "differences": json.loads(row["differences"]),
+            "totals": json.loads(row["totals"]),
+            "created_by": row["created_by"],
+            "applied_by": row["applied_by"],
+            "created_at": row["created_at"],
+            "applied_at": row["applied_at"],
+            "source": dict(source),
+        }
+
+    def save_split_draft(self, actor: str, payload: dict[str, Any], role: str = "editor") -> tuple[dict[str, Any], bool]:
+        if role != "editor":
+            raise DomainError("只有配额管理员可以办理账户拆分", 403)
+        try:
+            source_id = int(payload.get("source_account_id"))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("原账户编号必须是整数") from exc
+        note = str(payload.get("note", "")).strip()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            source = self._account_row(conn, source_id)
+            self._require_active(source, "原账户")
+            children = normalize_split_children(source, payload.get("children"))
+            result = evaluate_split(self._split_snapshot(conn, source_id), children)
+            existing = conn.execute(
+                "SELECT id FROM account_splits WHERE source_account_id=? AND status='draft'",
+                (source_id,),
+            ).fetchone()
+            now = utcnow()
+            serialized = (
+                json.dumps(children, ensure_ascii=False),
+                json.dumps(result["differences"], ensure_ascii=False),
+                json.dumps(result["totals"], ensure_ascii=False),
+            )
+            if existing:
+                conn.execute(
+                    "UPDATE account_splits SET children=?,differences=?,totals=?,note=?,created_by=?,created_at=? WHERE id=?",
+                    (*serialized, note, actor, now, existing["id"]),
+                )
+                split_id, action = int(existing["id"]), "split.draft_updated"
+            else:
+                cur = conn.execute(
+                    """INSERT INTO account_splits(source_account_id,children,differences,totals,note,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (source_id, *serialized, note, actor, now),
+                )
+                split_id, action = int(cur.lastrowid), "split.draft_saved"
+            self._audit(conn, actor, action, "account_split", split_id,
+                        {"source": source_id, "balanced": result["ok"],
+                         "difference_count": len(result["differences"])})
+            detail = self._split_detail(conn, split_id)
+        return detail, result["ok"]
+
+    def apply_split(self, split_id: int, actor: str, role: str = "editor") -> dict[str, Any]:
+        if role != "editor":
+            raise DomainError("只有配额管理员可以生效拆分", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM account_splits WHERE id=?", (split_id,)).fetchone()
+            if not row:
+                raise DomainError("拆分记录不存在", 404)
+            if row["status"] != "draft":
+                raise DomainError("该拆分已经生效，不能重复执行", 409)
+            source = self._account_row(conn, row["source_account_id"])
+            self._require_active(source, "原账户")
+            children = json.loads(row["children"])
+            # 生效前用最新余额和待审转让重跑一次纯判断，防止草稿期间数据变化。
+            result = evaluate_split(self._split_snapshot(conn, source["id"]), children)
+            if not result["ok"]:
+                raise DomainError("拆分差额未补齐，草稿已保留并列出差额", 409, result["differences"])
+            new_ids: list[int] = []
+            for child in children:
+                try:
+                    cur = conn.execute(
+                        """INSERT INTO accounts(name,region,holder,priority,valid_from,valid_to,
+                                                quota,used,status,split_from,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,'active',?,?)""",
+                        (child["name"], child["region"], child["holder"], child["priority"],
+                         child["valid_from"], child["valid_to"], child["quota"], child["used"],
+                         source["id"], utcnow()),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise DomainError(f"账户名称“{child['name']}”已存在", 409) from exc
+                new_ids.append(int(cur.lastrowid))
+            reassigned: list[int] = []
+            for child, new_id in zip(children, new_ids):
+                for transfer_id in child["outgoing_transfer_ids"]:
+                    conn.execute(
+                        "UPDATE transfers SET from_account_id=? WHERE id=? AND status='pending'",
+                        (new_id, transfer_id),
+                    )
+                    reassigned.append(int(transfer_id))
+                for transfer_id in child["incoming_transfer_ids"]:
+                    conn.execute(
+                        "UPDATE transfers SET to_account_id=? WHERE id=? AND status='pending'",
+                        (new_id, transfer_id),
+                    )
+                    reassigned.append(int(transfer_id))
+            conn.execute("UPDATE accounts SET status='closed' WHERE id=?", (source["id"],))
+            conn.execute(
+                "UPDATE account_splits SET status='applied',applied_by=?,applied_at=? WHERE id=?",
+                (actor, utcnow(), split_id),
+            )
+            self._audit(conn, actor, "split.applied", "account_split", split_id,
+                        {"source": source["id"], "new_accounts": new_ids,
+                         "reassigned_transfers": reassigned, "totals": result["totals"]})
+            detail = self._split_detail(conn, split_id)
+        return detail
+
+    def split_detail(self, split_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            return self._split_detail(conn, split_id)
+
+    def list_splits(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM account_splits ORDER BY id DESC").fetchall()
+            result = []
+            for row in rows:
+                item = {k: row[k] for k in row.keys() if k not in {"children", "differences", "totals"}}
+                item["children_count"] = len(json.loads(row["children"]))
+                item["difference_count"] = len(json.loads(row["differences"]))
+                item["totals"] = json.loads(row["totals"])
+                result.append(item)
+        return result
+
     def _reserved_outgoing(self, conn: sqlite3.Connection, account_id: int) -> float:
         row = conn.execute("SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE from_account_id=? AND status='pending'", (account_id,)).fetchone()
         return float(row["total"])
@@ -214,6 +577,8 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             source = self._account_row(conn, source_id)
             target = self._account_row(conn, target_id)
+            self._require_active(source, "转出账户")
+            self._require_active(target, "转入账户")
             if not (source["valid_from"] <= effective.isoformat() <= source["valid_to"]):
                 raise DomainError("转出账户在生效日无效", 409)
             if not (target["valid_from"] <= effective.isoformat() <= target["valid_to"]):
@@ -313,6 +678,7 @@ class Database:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             account = self._account_row(conn, account_id)
+            self._require_active(account)
             if not (account["valid_from"] <= occurred.isoformat() <= account["valid_to"]):
                 raise DomainError("取水日期不在许可有效期内", 409)
             reserved = self._reserved_outgoing(conn, account_id)
@@ -349,7 +715,8 @@ class Database:
         if total_supply < 0 or not 0 <= reduction < 1:
             raise DomainError("供水量不能为负，削减比例应在 0 到 1 之间")
         with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM accounts ORDER BY priority,name").fetchall()
+            # 拆分关闭后的账户只供查询，不再参与干旱分配。
+            rows = conn.execute("SELECT * FROM accounts WHERE status='active' ORDER BY priority,name").fetchall()
         supply = total_supply * (1 - reduction)
         allocation: dict[int, float] = {}
         deficit: dict[int, float] = {}
@@ -459,11 +826,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"accounts": self.db.list_accounts()})
             if parsed.path == "/api/transfers":
                 return self._send({"transfers": self.db.list_transfers()})
+            if parsed.path == "/api/splits":
+                return self._send({"splits": self.db.list_splits()})
             if parsed.path == "/api/audit":
                 return self._send({"audit": self.db.audit()})
             if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/available"):
                 account_id = int(parsed.path.split("/")[3])
                 return self._send(self.db.available(account_id))
+            if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/split-preview"):
+                account_id = int(parsed.path.split("/")[3])
+                return self._send(self.db.split_preview(account_id))
+            if parsed.path.startswith("/api/splits/"):
+                split_id = int(parsed.path.split("/")[3])
+                return self._send(self.db.split_detail(split_id))
             if parsed.path == "/api/drought/simulate":
                 q = parse_qs(parsed.query)
                 return self._send(self.db.simulate_drought(float(q.get("supply", ["0"])[0]), float(q.get("reduction", ["0"])[0])))
@@ -491,9 +866,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.reject_transfer(int(parts[2]), actor, role))
             if parts == ["api", "usage"]:
                 return self._send(self.db.record_usage(actor, body, role), 201)
+            if parts == ["api", "splits"]:
+                # 对不上时不报错拒绝：草稿照常落库，差额随 202 响应返回。
+                detail, balanced = self.db.save_split_draft(actor, body, role)
+                return self._send(detail, 200 if balanced else 202)
+            if len(parts) == 4 and parts[:2] == ["api", "splits"] and parts[3] == "apply":
+                return self._send(self.db.apply_split(int(parts[2]), actor, role), 201)
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
-            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+            self._send({"error": str(exc), **({"differences": exc.details} if getattr(exc, "details", None) else {})},
+                       getattr(exc, "status", 400))
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[water] {self.address_string()} - {fmt % args}")

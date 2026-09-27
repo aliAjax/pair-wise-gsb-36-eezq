@@ -1,18 +1,174 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>水资源权配置</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}small{color:#667}button{cursor:pointer}</style></head>
-<body><h1>跨区域水资源使用权</h1><p>示例账户初始化后，可查看余额、发起转让、审核，并模拟干旱分配。</p>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:1040px;margin:32px auto;padding:0 18px}
+input,select,button{padding:7px;margin:3px}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}
+pre{background:#f5f7f9;padding:12px;overflow:auto}
+small{color:#667}button{cursor:pointer}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+th,td{border:1px solid #d9e1e8;padding:6px 8px;text-align:left;font-size:14px}
+.closed{color:#b05656;font-weight:600}
+.ok{color:#1a7f37;font-weight:600}
+.bad{color:#b42318;font-weight:600}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;background:#eef3f8;font-size:12px}
+.tag.closed{background:#fdecec}
+.tag.applied{background:#e8f5ec}
+.tag.draft{background:#fff5e0}
+</style></head>
+<body><h1>跨区域水资源使用权</h1><p>账户拆分：逐项核对许可额度、已用水量和待审转让承接，对不上只存草稿并列差额；生效后原账户只供查询。</p>
 <div class="card"><h2>身份</h2><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>meter</option><option>viewer</option></select></div>
-<div class="card"><h2>账户</h2><button onclick="getAccounts()">刷新账户</button><pre id="accounts">等待操作…</pre></div>
+<div class="card"><h2>账户</h2><button onclick="getAccounts()">刷新账户</button><div id="accounts"><small>等待操作…</small></div></div>
 <div class="card"><h2>发起转让</h2><input id="from" type="number" value="1" placeholder="转出账户"><input id="to" type="number" value="2" placeholder="转入账户"><input id="amount" type="number" value="400"><input id="date" type="date" value="2026-06-01"><button onclick="transfer()">提交审批</button><pre id="result"></pre></div>
 <div class="card"><h2>审批最新转让</h2><input id="transfer_id" type="number" placeholder="转让 ID"><button onclick="approve()">批准</button><button onclick="reject()">退回</button></div>
+
+<div class="card">
+<h2>账户拆分</h2>
+原账户 ID：<input id="split_src" type="number" placeholder="如 1" style="width:90px">
+<button onclick="loadSplitPreview()">载入拆分前明细</button>
+<div id="split_before"><small>载入后显示拆分前的许可额度、已用水量和待审转让。</small></div>
+<div id="split_form" style="display:none;margin-top:12px">
+备注 <input id="split_note" placeholder="如：灌区改制" style="width:260px">
+<table id="children_table"><thead><tr>
+<th>#</th><th>子账户名称</th><th>持有人</th><th>地区</th><th>优先级</th>
+<th>许可额度</th><th>已用水量</th><th>承接转出(逗号分隔)</th><th>承接转入(逗号分隔)</th><th></th>
+</tr></thead><tbody></tbody></table>
+<button onclick="addChildRow()">增加子账户</button>
+<p id="split_totals"></p>
+<p><button onclick="saveDraft()">保存草稿（以后端核对为准）</button></p>
+<pre id="split_diff" style="display:none"></pre>
+<p id="split_apply"></p>
+</div>
+</div>
+<div class="card"><h2>拆分记录与拆分后明细</h2><button onclick="getSplits()">刷新拆分记录</button><div id="splits"><small>等待操作…</small></div></div>
+
 <div class="card"><h2>干旱情景</h2><input id="supply" type="number" value="1200"><input id="reduction" type="number" value="0.3" step="0.1"><button onclick="simulate()">模拟</button><pre id="drought">等待操作…</pre></div>
 <script>
 const headers=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
-async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
-async function getAccounts(){try{accounts.textContent=JSON.stringify(await call('/api/accounts'),null,2)}catch(e){accounts.textContent=e.message}}
+async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Object.assign(Error(j.error||r.status),{differences:j.differences,status:r.status});j._status=r.status;return j}
+
+async function getAccounts(){try{
+ const j=await call('/api/accounts');
+ accounts.innerHTML='<table><thead><tr><th>ID</th><th>名称</th><th>地区</th><th>持有人</th><th>优先级</th><th>许可额度</th><th>已用</th><th>待审预占</th><th>可用</th><th>状态</th></tr></thead><tbody>'+
+  j.accounts.map(a=>`<tr><td>${a.id}</td><td>${esc(a.name)}</td><td>${esc(a.region)}</td><td>${esc(a.holder)}</td><td>${a.priority}</td><td>${a.quota}</td><td>${a.used}</td><td>${a.reserved_outgoing!==undefined?a.reserved_outgoing:''}</td><td>${a.available}</td><td>${a.status==='closed'?'<span class="tag closed">已关闭（只供查询）</span>':'<span class="tag">活跃</span>'}</td></tr>`).join('')+'</tbody></table>';
+}catch(e){accounts.textContent=e.message}}
+
+let splitPreview=null;
+async function loadSplitPreview(){try{
+ const id=+split_src.value; splitPreview=await call('/api/accounts/'+id+'/split-preview');
+ if(splitPreview.source.status!=='active'){split_before.innerHTML='<p class="bad">该账户已随拆分关闭，只供查询，不能再拆。</p>';split_form.style.display='none';return}
+ const out=splitPreview.pending_outgoing,t=splitPreview.pending_incoming;
+ split_before.innerHTML=`<table><thead><tr><th>项目</th><th>拆分前</th></tr></thead><tbody>
+  <tr><td>许可额度合计</td><td><b>${splitPreview.quota}</b></td></tr>
+  <tr><td>已用水量合计</td><td><b>${splitPreview.used}</b></td></tr>
+  <tr><td>待审转出</td><td>${out.length?out.map(x=>`#${x.id} 转给 ${esc(x.other_name)}，${x.amount}（生效 ${x.effective_date}）`).join('<br>'):'无'}</td></tr>
+  <tr><td>待审转入</td><td>${t.length?t.map(x=>`#${x.id} 来自 ${esc(x.other_name)}，${x.amount}（生效 ${x.effective_date}）`).join('<br>'):'无'}</td></tr>
+  </tbody></table>`;
+ split_form.style.display='block';
+ document.querySelector('#children_table tbody').innerHTML='';
+ split_diff.style.display='none'; split_apply.innerHTML='';
+ addChildRow(); addChildRow();
+ refreshClientTotals();
+}catch(e){split_before.innerHTML='<p class="bad">'+e.message+'</p>';split_form.style.display='none'}}
+
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function idList(v){return String(v).split(',').map(x=>+x.trim()).filter(x=>Number.isInteger(x)&&x>0)}
+
+function addChildRow(){
+ const n=document.querySelectorAll('#children_table tbody tr').length;
+ const p=splitPreview.source;
+ document.querySelector('#children_table tbody').insertAdjacentHTML('beforeend',
+ `<tr><td>${n+1}</td>
+  <td><input data-k="name" style="width:110px"></td>
+  <td><input data-k="holder" value="${esc(p.holder)}" style="width:110px"></td>
+  <td><input data-k="region" value="${esc(p.region)}" style="width:90px"></td>
+  <td><input data-k="priority" type="number" value="${p.priority}" min="1" max="5" style="width:56px"></td>
+  <td><input data-k="quota" type="number" oninput="refreshClientTotals()" style="width:90px"></td>
+  <td><input data-k="used" type="number" oninput="refreshClientTotals()" style="width:90px"></td>
+  <td><input data-k="outgoing_transfer_ids" style="width:110px"></td>
+  <td><input data-k="incoming_transfer_ids" style="width:110px"></td>
+  <td><button onclick="this.closest('tr').remove();refreshClientTotals()">删</button></td></tr>`);
+ refreshClientTotals();
+}
+
+// 客户端只做即时提示；最终数据、判断以服务端核对结果为准。
+function refreshClientTotals(){
+ if(!splitPreview)return;
+ const rows=[...document.querySelectorAll('#children_table tbody tr')];
+ let q=0,u=0,out=new Set(),inc=new Set,dup=[];
+ for(const tr of rows){
+  q+=+(tr.querySelector('[data-k=quota]').value)||0;
+  u+=+(tr.querySelector('[data-k=used]').value)||0;
+  for(const id of idList(tr.querySelector('[data-k=outgoing_transfer_ids]').value)){dup=dup.concat(out.has(id)?[id]:[]);out.add(id)}
+  for(const id of idList(tr.querySelector('[data-k=incoming_transfer_ids]').value)){dup=dup.concat(inc.has(id)?[id]:[]);inc.add(id)}
+ }
+ const expectOut=splitPreview.pending_outgoing.map(x=>x.id),expectIn=splitPreview.pending_incoming.map(x=>x.id);
+ const miss=[...expectOut.filter(x=>!out.has(x)),...expectIn.filter(x=>!inc.has(x))];
+ const dq=q-splitPreview.quota,du=u-splitPreview.used;
+ split_totals.innerHTML=`许可额度合计 <b>${q}</b>（拆分前 ${splitPreview.quota}，差额 <span class="${Math.abs(dq)<1e-9?'ok':'bad'}">${dq}</span>）　已用水合计 <b>${u}</b>（拆分前 ${splitPreview.used}，差额 <span class="${Math.abs(du)<1e-9?'ok':'bad'}">${du}</span>）<br>`+
+  `承接转让：转出 ${out.size}/${expectOut.length}，转入 ${inc.size}/${expectIn.length}`+
+  (dup.length?`　<span class="bad">重复承接：${[...new Set(dup)].join(',')}</span>`:'')+
+  (miss.length?`　<span class="bad">未承接：${miss.join(',')}</span>`:'');
+}
+
+function collectChildren(){
+ return [...document.querySelectorAll('#children_table tbody tr')].map(tr=>{
+  const get=k=>tr.querySelector(`[data-k=${k}]`).value.trim();
+  return {name:get('name'),holder:get('holder'),region:get('region'),priority:+get('priority'),
+   quota:+get('quota'),used:+get('used'),
+   outgoing_transfer_ids:idList(get('outgoing_transfer_ids')),incoming_transfer_ids:idList(get('incoming_transfer_ids'))};
+ });
+}
+
+async function saveDraft(){
+ split_diff.style.display='none';split_apply.innerHTML='';
+ try{
+  const j=await call('/api/splits',{method:'POST',headers:headers(),body:JSON.stringify(
+   {source_account_id:+split_src.value,note:split_note.value,children:collectChildren()})});
+  split_diff.style.display='block';
+  split_diff.textContent=(j._status===200?'核对通过，草稿已保存（平衡，可生效）。\n':'已保存为草稿，存在以下差额，不能生效：\n')+JSON.stringify(j.differences,null,2);
+  split_apply.innerHTML=j._status===200?`<button onclick="applySplit(${j.id})">生效拆分 #${j.id}</button> <small>生效后原账户关闭，只供查询；新账户可取水、转让、参与干旱分配。</small>`:'';
+  getSplits();
+ }catch(e){
+  split_diff.style.display='block';
+  split_diff.textContent='保存失败：'+e.message+(e.differences?'\n'+JSON.stringify(e.differences,null,2):'');
+ }
+}
+
+async function applySplit(id){
+ try{
+  const j=await call('/api/splits/'+id+'/apply',{method:'POST',headers:headers(),body:'{}'});
+  split_apply.innerHTML='<span class="ok">拆分已生效，新账户：'+j.children.map(c=>esc(c.name)).join('、')+'（见下方账户列表）</span>';
+  loadSplitPreview();getAccounts();getSplits();
+ }catch(e){split_apply.innerHTML='<span class="bad">生效失败：'+e.message+'</span>'}
+}
+
+async function getSplits(){try{
+ const j=await call('/api/splits');
+ splits.innerHTML='<table><thead><tr><th>ID</th><th>原账户</th><th>状态</th><th>子账户数</th><th>差额数</th><th>额度合计/拆分前</th><th>已用合计/拆分前</th><th>创建人</th><th>生效人</th><th></th></tr></thead><tbody>'+
+  j.splits.map(s=>`<tr><td>${s.id}</td><td>#${s.source_account_id}</td><td><span class="tag ${s.status}">${s.status==='draft'?'草稿':'已生效'}</span></td><td>${s.children_count}</td><td class="${s.difference_count?'bad':'ok'}">${s.difference_count}</td><td>${s.totals.quota??''} / ${s.totals.expected_quota??''}</td><td>${s.totals.used??''} / ${s.totals.expected_used??''}</td><td>${esc(s.created_by)}</td><td>${esc(s.applied_by||'')}</td><td><button onclick="getSplitDetail(${s.id})">看前后明细</button></td></tr>`).join('')+'</tbody></table>'+
+  '<pre id="split_detail_pretty" style="display:none"></pre>';
+}catch(e){splits.textContent=e.message}}
+
+async function getSplitDetail(id){
+ try{
+  const j=await call('/api/splits/'+id);
+  const box=document.getElementById('split_detail_pretty');
+  box.style.display='block';
+  box.textContent=JSON.stringify({
+   id:j.id,status:j.status,note:j.note,
+   before:{account_id:j.source.id,name:j.source.name,quota:j.source.quota,used:j.source.used,status:j.source.status},
+   after:j.children.map((c,i)=>({index:i+1,name:c.name,holder:c.holder,region:c.region,priority:c.priority,
+     valid_from:c.valid_from,valid_to:c.valid_to,quota:c.quota,used:c.used,
+     outgoing_transfer_ids:c.outgoing_transfer_ids,incoming_transfer_ids:c.incoming_transfer_ids})),
+   totals:j.totals,differences:j.differences,
+   created_by:j.created_by,applied_by:j.applied_by,created_at:j.created_at,applied_at:j.applied_at},null,2);
+ }catch(e){alert(e.message)}
+}
+
 async function transfer(){try{result.textContent=JSON.stringify(await call('/api/transfers',{method:'POST',headers:headers(),body:JSON.stringify({from_account_id:+from.value,to_account_id:+to.value,amount:+amount.value,effective_date:date.value})}),null,2)}catch(e){result.textContent=e.message}}
-async function approve(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/approve',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
-async function reject(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/reject',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
+async function approve(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/approve',{method:'POST',headers:headers(),body:'{}'}),null,2);getAccounts()}catch(e){result.textContent=e.message}}
+async function reject(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/reject',{method:'POST',headers:headers(),body:'{}'}),null,2);getAccounts()}catch(e){result.textContent=e.message}}
 async function simulate(){try{drought.textContent=JSON.stringify(await call('/api/drought/simulate?supply='+supply.value+'&reduction='+reduction.value),null,2)}catch(e){drought.textContent=e.message}}
+getAccounts();
 </script></body></html>
